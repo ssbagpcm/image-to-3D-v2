@@ -67,7 +67,7 @@ The core of this project is **Depth Anything V2 (DAV2)**, a powerful foundation 
 1.  **Clone the Repository**
     ```bash
     git clone https://github.com/ssbagpcm/image-to-3D-v2.git
-    cd image-to- 3D-v2
+    cd image-to-3D-v2
     ```
 
 2.  **Create and Activate a Virtual Environment** (Recommended)
