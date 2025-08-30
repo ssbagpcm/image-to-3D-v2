@@ -1,0 +1,15 @@
+# Core web framework and async file handling
+fastapi
+uvicorn[standard]
+python-multipart
+aiofiles
+
+# ML / AI libraries
+torch
+transformers
+huggingface_hub
+
+# Image and numerical processing
+numpy
+opencv-contrib-python
+Pillow
