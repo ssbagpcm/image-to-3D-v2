@@ -66,8 +66,8 @@ The core of this project is **Depth Anything V2 (DAV2)**, a powerful foundation 
 
 1.  **Clone the Repository**
     ```bash
-    git clone https://github.com/ssbagpcm/image-to-3D-v2.git
-    cd image-to-3D-v2
+    git clone https://github.com/your-username/your-repo-name.git
+    cd your-repo-name
     ```
 
 2.  **Create and Activate a Virtual Environment** (Recommended)
@@ -139,3 +139,5 @@ To get started quickly, this repository includes a `demos/` directory containing
 - **Backend**: FastAPI, PyTorch, Transformers, OpenCV
 - **Frontend**: Three.js, HTML5, JavaScript
 - **ML Model**: Depth Anything V2 (from Hugging Face)
+
+# v2.1 : Now process videos. feel free to try it out ! (Raequire gpu with at least 8gb VRAM)
