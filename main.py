@@ -1,8 +1,13 @@
 import os
+import sys
 import uuid
 import math
 import shutil
 import subprocess
+import zipfile
+import json
+from datetime import datetime, timezone
+
 import numpy as np
 import cv2
 from PIL import Image
@@ -15,7 +20,14 @@ import aiofiles
 import torch
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 from huggingface_hub import login as hf_login
+from huggingface_hub import hf_hub_download
 from string import Template
+
+# Ajouts pour VDA/vidéo
+import glob
+import tempfile
+from pathlib import Path
+import urllib.request
 
 # =========================
 # HF config (env var recommended)
@@ -45,7 +57,8 @@ DEPTH_DIR = os.path.join(BASE_DIR, "depths")              # image depth (8-bit o
 NORMAL_DIR = os.path.join(BASE_DIR, "normals")            # image normal map
 VIDEO_DIR = os.path.join(BASE_DIR, "videos")              # color videos (mp4)
 DEPTH_VIDEO_DIR = os.path.join(BASE_DIR, "depth_videos")  # depth videos (mp4)
-for d in (UPLOAD_DIR, DEPTH_DIR, NORMAL_DIR, VIDEO_DIR, DEPTH_VIDEO_DIR):
+PRODUCTIONS_DIR = os.path.join(BASE_DIR, "productions")   # portable packages + staged assets
+for d in (UPLOAD_DIR, DEPTH_DIR, NORMAL_DIR, VIDEO_DIR, DEPTH_VIDEO_DIR, PRODUCTIONS_DIR):
     os.makedirs(d, exist_ok=True)
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
@@ -53,6 +66,7 @@ app.mount("/depths", StaticFiles(directory=DEPTH_DIR), name="depths")
 app.mount("/normals", StaticFiles(directory=NORMAL_DIR), name="normals")
 app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="videos")
 app.mount("/depth_videos", StaticFiles(directory=DEPTH_VIDEO_DIR), name="depth_videos")
+app.mount("/productions", StaticFiles(directory=PRODUCTIONS_DIR), name="productions")
 
 # =========================
 # Device preference & logs
@@ -99,6 +113,24 @@ DEPTH_DITHER = os.getenv("DEPTH_DITHER", "1") == "1"
 
 # Pack image depth in pseudo 16-bit (R=high, G=low); big improvement vs 8-bit
 SAVE_DEPTH_RG16 = os.getenv("DEPTH_PNG_RG16", "1") == "1"
+
+# =========================
+# Video backend selection (NEW)
+# =========================
+VIDEO_BACKEND = os.getenv("VIDEO_BACKEND", "vda").strip().lower()  # 'vda' (Video-Depth-Anything) or 'dav2'
+
+# Video-Depth-Anything settings (used when VIDEO_BACKEND='vda')
+# Si VDA_DIR n'est pas fourni → clone auto dans BASE_DIR/ext/Video-Depth-Anything
+VDA_DIR_DEFAULT = os.path.join(BASE_DIR, "ext", "Video-Depth-Anything")
+VDA_DIR         = os.getenv("VDA_DIR", VDA_DIR_DEFAULT).strip()
+VDA_ENCODER     = os.getenv("VDA_ENCODER", "vits").strip()         # vits | vitb | vitl
+VDA_INPUT_SIZE  = int(os.getenv("VDA_INPUT_SIZE", "518"))
+VDA_MAX_RES     = int(os.getenv("VDA_MAX_RES", "1280"))
+VDA_MAX_LEN     = int(os.getenv("VDA_MAX_LEN", "-1"))
+VDA_TARGET_FPS  = int(os.getenv("VDA_TARGET_FPS", "-1"))
+VDA_FP32        = os.getenv("VDA_FP32", "0") == "1"
+# Stream-copy couleur si déjà MP4/H.264(HEVC) compatible; sinon re-encode lossless si =1
+VDA_STRICT_LOSSLESS = os.getenv("VDA_STRICT_LOSSLESS", "1") == "1"
 
 CANDIDATES_L = [
     "depth-anything/Depth-Anything-V2-Large",
@@ -406,32 +438,307 @@ def predict_depth_dav2(image_path, out_depth8, out_normal):
     return out_depth8, out_normal
 
 # =========================
+# X25D helpers (portable packages)
+# =========================
+def _now_iso():
+    try:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return ""
+
+def _parse_bool(s: str, default=None):
+    if s is None:
+        return default
+    s = str(s).strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    return default
+
+def _probe_video_info(path: str):
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return (0, 0, 0.0)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    if not fps or math.isnan(fps) or fps <= 0: fps = 30.0
+    return (w, h, float(fps))
+
+def _copy_to_dir(dst_dir: str, src_path: str, dst_name: str) -> str:
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, dst_name)
+    # no-op si même chemin ou même fichier
+    try:
+        same = (os.path.abspath(src_path) == os.path.abspath(dst))
+        if not same and os.path.exists(src_path) and os.path.exists(dst):
+            try:
+                same = os.path.samefile(src_path, dst)
+            except Exception:
+                same = False
+    except Exception:
+        same = False
+    if same:
+        return dst
+    # sinon, copie (remplace si déjà là)
+    if os.path.abspath(src_path) != os.path.abspath(dst):
+        shutil.copy2(src_path, dst)
+    return dst
+
+def _guess_depth_packed_from_png(png_path: str) -> bool:
+    # Heuristique: depth RG16 = PNG RGB où B≈0 et R!=G souvent; 8-bit = grayscale
+    try:
+        im = Image.open(png_path)
+        if im.mode in ("L", "LA", "I", "I;16"):
+            return False
+        arr = np.array(im.convert("RGB"))
+        r, g, b = arr[...,0].astype(np.int32), arr[...,1].astype(np.int32), arr[...,2].astype(np.int32)
+        b_sum = np.mean(np.abs(b))
+        rg_diff = float(np.mean(np.abs(r - g)))
+        return (b_sum < 1.5) and (rg_diff > 0.5)
+    except Exception:
+        return False
+
+def _write_meta_json(path: str, meta: dict):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+def pack_x25d_image(prod_id: str, img_path: str, depth_png_path: str, normal_png_path: str, packed_rg16: bool, model_id: str = "") -> dict:
+    # Stage dans productions/<prod_id>/ puis bundle productions/<prod_id>.x25d
+    stage_dir = os.path.join(PRODUCTIONS_DIR, prod_id)
+    _, ext = os.path.splitext(img_path)
+    color_name = f"color{ext.lower()}"
+    depth_name = "depth.png"
+    normal_name = "normal.png"
+
+    # Copie assets
+    color_dst = _copy_to_dir(stage_dir, img_path, color_name)
+    depth_dst = _copy_to_dir(stage_dir, depth_png_path, depth_name)
+    normal_dst= _copy_to_dir(stage_dir, normal_png_path, normal_name)
+    with Image.open(color_dst) as im:
+        w, h = im.size
+
+    meta = {
+        "x25d": 1,
+        "type": "image",
+        "app": "3D Depth (DAV2)",
+        "created": _now_iso(),
+        "color": color_name,
+        "depth": depth_name,
+        "normal": normal_name,
+        "width": w, "height": h,
+        "depth_packed_rg16": bool(packed_rg16),
+        "model": model_id or "",
+    }
+    _write_meta_json(os.path.join(stage_dir, "meta.json"), meta)
+
+    # Bundle
+    x25d_path = os.path.join(PRODUCTIONS_DIR, f"{prod_id}.x25d")
+    with zipfile.ZipFile(x25d_path, "w") as z:
+        z.write(color_dst, arcname=color_name, compress_type=zipfile.ZIP_DEFLATED)
+        z.write(depth_dst, arcname=depth_name, compress_type=zipfile.ZIP_DEFLATED)
+        z.write(normal_dst, arcname=normal_name, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
+
+    return {
+        "prod_id": prod_id,
+        "x25d_path": x25d_path,
+        "x25d_url": f"/productions/{os.path.basename(x25d_path)}",
+        "color_url": f"/productions/{prod_id}/{color_name}",
+        "depth_url": f"/productions/{prod_id}/{depth_name}",
+        "normal_url": f"/productions/{prod_id}/{normal_name}",
+        "packed": bool(packed_rg16),
+    }
+
+def pack_x25d_video(prod_id: str, color_mp4: str, depth_mp4: str, model_id: str = "") -> dict:
+    stage_dir = os.path.join(PRODUCTIONS_DIR, prod_id)
+    color_name = "color.mp4"
+    depth_name = "depth.mp4"
+    color_dst = _copy_to_dir(stage_dir, color_mp4, color_name)
+    depth_dst = _copy_to_dir(stage_dir, depth_mp4, depth_name)
+    w, h, fps = _probe_video_info(color_dst)
+
+    meta = {
+        "x25d": 1,
+        "type": "video",
+        "app": "3D Depth (DAV2)",
+        "created": _now_iso(),
+        "color": color_name,
+        "depth": depth_name,
+        "width": w, "height": h,
+        "fps": fps,
+        "model": model_id or "",
+        "depth_dither": bool(DEPTH_DITHER),
+        "video_norm_calibrated": bool(VIDEO_CALIBRATE),
+    }
+    _write_meta_json(os.path.join(stage_dir, "meta.json"), meta)
+
+    x25d_path = os.path.join(PRODUCTIONS_DIR, f"{prod_id}.x25d")
+    with zipfile.ZipFile(x25d_path, "w") as z:
+        # mp4 = stockés sans recompression
+        z.write(color_dst, arcname=color_name, compress_type=zipfile.ZIP_STORED)
+        z.write(depth_dst, arcname=depth_name, compress_type=zipfile.ZIP_STORED)
+        z.writestr("meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
+
+    return {
+        "prod_id": prod_id,
+        "x25d_path": x25d_path,
+        "x25d_url": f"/productions/{os.path.basename(x25d_path)}",
+        "color_url": f"/productions/{prod_id}/{color_name}",
+        "depth_url": f"/productions/{prod_id}/{depth_name}",
+    }
+
+def import_x25d_package(file_path: str) -> dict:
+    """
+    Importe un .x25d externe dans productions/<prod_id>/ et retourne infos pour la vue.
+    """
+    prod_id = uuid.uuid4().hex
+    stage_dir = os.path.join(PRODUCTIONS_DIR, prod_id)
+    os.makedirs(stage_dir, exist_ok=True)
+
+    with zipfile.ZipFile(file_path, "r") as z:
+        # Meta
+        try:
+            meta = json.loads(z.read("meta.json").decode("utf-8"))
+        except Exception:
+            meta = None
+
+        # Détermine noms
+        if meta and "type" in meta:
+            x_type = meta["type"]
+            color_src = meta.get("color")
+            depth_src = meta.get("depth")
+            normal_src = meta.get("normal")
+            packed = bool(meta.get("depth_packed_rg16", False))
+        else:
+            # fallback: heuristique
+            names = set([zi.filename for zi in z.infolist()])
+            x_type = "video" if any(n.lower().endswith(".mp4") and "depth" in n.lower() for n in names) else "image"
+            color_src = next((n for n in names if n.lower().startswith("color.")), None)
+            depth_src = next((n for n in names if n.lower().startswith("depth.")), None)
+            normal_src = "normal.png" if "normal.png" in names else None
+            packed = False
+
+        # Extraction contrôlée
+        def _extract_as(src_name: str, dst_name: str):
+            with z.open(src_name) as fsrc, open(os.path.join(stage_dir, dst_name), "wb") as fdst:
+                shutil.copyfileobj(fsrc, fdst)
+
+        if x_type == "image":
+            if not (color_src and depth_src and normal_src):
+                raise RuntimeError("Invalid x25d (image) — missing color/depth/normal.")
+            _, cext = os.path.splitext(color_src)
+            color_name = f"color{cext.lower() or '.png'}"
+            _extract_as(color_src, color_name)
+            _extract_as(depth_src, "depth.png")
+            _extract_as(normal_src, "normal.png")
+            # Si meta absent, devine packed
+            if meta is None:
+                packed = _guess_depth_packed_from_png(os.path.join(stage_dir, "depth.png"))
+            # Recrée meta local
+            try:
+                with Image.open(os.path.join(stage_dir, color_name)) as im:
+                    w, h = im.size
+            except Exception:
+                w = h = 0
+            meta_out = {
+                "x25d": 1, "type": "image", "app": "3D Depth (DAV2)", "created": _now_iso(),
+                "color": color_name, "depth": "depth.png", "normal": "normal.png",
+                "width": w, "height": h, "depth_packed_rg16": bool(packed),
+            }
+            _write_meta_json(os.path.join(stage_dir, "meta.json"), meta_out)
+            return {
+                "type": "image",
+                "packed": bool(packed),
+                "img_url": f"/productions/{prod_id}/{color_name}",
+                "depth_url": f"/productions/{prod_id}/depth.png",
+                "normal_url": f"/productions/{prod_id}/normal.png",
+                "prod_id": prod_id,
+            }
+        else:
+            if not (color_src and depth_src):
+                raise RuntimeError("Invalid x25d (video) — missing color/depth.")
+            _extract_as(color_src, "color.mp4")
+            _extract_as(depth_src, "depth.mp4")
+            w, h, fps = _probe_video_info(os.path.join(stage_dir, "color.mp4"))
+            meta_out = {
+                "x25d": 1, "type": "video", "app":"3D Depth (DAV2)", "created": _now_iso(),
+                "color": "color.mp4", "depth": "depth.mp4", "width": w, "height": h, "fps": fps
+            }
+            _write_meta_json(os.path.join(stage_dir, "meta.json"), meta_out)
+            return {
+                "type": "video",
+                "color_url": f"/productions/{prod_id}/color.mp4",
+                "depth_url": f"/productions/{prod_id}/depth.mp4",
+                "prod_id": prod_id,
+            }
+
+# =========================
 # Video processing (offline)
 # =========================
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
+def ffprobe_available() -> bool:
+    return shutil.which("ffprobe") is not None
+
+def ffprobe_stream_info(path: str):
+    if not ffprobe_available():
+        return None
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name,pix_fmt,width,height,r_frame_rate,avg_frame_rate",
+            "-of", "json", path
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        data = json.loads(out.decode("utf-8", "ignore"))
+        st = (data.get("streams") or [None])[0]
+        return st or None
+    except Exception:
+        return None
+
 def transcode_to_mp4_hd_hq(src_path: str, out_path: str, lossless_env: bool = False):
     """
-    Transcode to MP4 H.264 + AAC for web playback:
-    - upscale to at least 1080p using Lanczos (keep >1080p as-is, preserve AR)
-    - high-quality visually lossless; set STRICT_LOSSLESS=1 to try x264 lossless (heavy; chroma still 4:2:0)
+    Smart MP4 transcode:
+    - Si source déjà MP4 + H.264/HEVC (yuv420p/10) → remux -c copy +faststart (aucune recompression, aucune perte)
+    - Sinon, ré-encodage de très haute qualité (ou strict lossless si lossless_env=True)
+    - Aucune mise à l'échelle forcée
     """
     if not ffmpeg_available():
         raise RuntimeError("ffmpeg not available to transcode video.")
 
-    # Scale expression: upscale to meet or exceed 1920x1080, else keep original (no downscale)
-    scale_expr_w = "ceil(iw*max(1\\, max(1920/iw\\,1080/ih))/2)*2"
-    scale_expr_h = "ceil(ih*max(1\\, max(1920/iw\\,1080/ih))/2)*2"
-    vf = f"scale={scale_expr_w}:{scale_expr_h}:flags=lanczos"
+    # Remux direct si possible
+    src_ext = os.path.splitext(src_path)[1].lower()
+    info = ffprobe_stream_info(src_path)
 
+    can_copy = False
+    if src_ext == ".mp4" and info is not None:
+        codec = (info.get("codec_name") or "").lower()
+        pix   = (info.get("pix_fmt") or "").lower()
+        if codec in ("h264", "hevc") and pix in ("yuv420p", "yuv420p10le", "yuvj420p"):
+            can_copy = True
+
+    if can_copy:
+        cmd = [
+            "ffmpeg", "-y", "-i", src_path,
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-c", "copy",
+            "-movflags", "+faststart",
+            out_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return
+
+    # Sinon, ré-encode sans resize
     strict_lossless = lossless_env or os.getenv("STRICT_LOSSLESS", "0") == "1"
-
     if strict_lossless:
         cmd = [
             "ffmpeg", "-y", "-i", src_path,
             "-map", "0:v:0", "-map", "0:a:0?",
-            "-vf", vf,
             "-c:v", "libx264", "-preset", "slow", "-crf", "0",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k",
@@ -439,18 +746,17 @@ def transcode_to_mp4_hd_hq(src_path: str, out_path: str, lossless_env: bool = Fa
             out_path
         ]
     else:
-        # Visually lossless for web
         cmd = [
             "ffmpeg", "-y", "-i", src_path,
             "-map", "0:v:0", "-map", "0:a:0?",
-            "-vf", vf,
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-profile:v", "high", "-preset", "slow", "-crf", os.getenv("VIDEO_CRF", "14"), "-tune", "grain",
+            "-profile:v", "high", "-preset", "slow",
+            "-crf", os.getenv("VIDEO_CRF", "12"),
+            "-tune", "grain",
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
             out_path
         ]
-
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 def _try_open_video_writer(path: str, fps: float, size_wh: tuple) -> cv2.VideoWriter:
@@ -621,7 +927,199 @@ def process_video_to_depth(color_path: str, out_depth_path: str, ema_alpha: floa
     print(f"[Depth-Video] Done. Frames: {frame_idx}, out: {out_depth_path}")
 
 # =========================
-# HTML — Drag & drop (images + videos)
+# NEW — Video-Depth-Anything helpers/pipeline
+# =========================
+def _find_latest_file(root: str, pattern: str) -> str:
+    files = glob.glob(os.path.join(root, "**", pattern), recursive=True)
+    if not files:
+        return ""
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files[0]
+
+def _encode_pngs_to_mp4(frame_paths: list, out_path: str, fps: float):
+    """
+    Encode sorted list of PNG depth frames to MP4 (H.264).
+    Preference: ffmpeg (CRF 0) if available; fallback to OpenCV VideoWriter.
+    """
+    if not frame_paths:
+        raise RuntimeError("No frames to encode.")
+    if ffmpeg_available():
+        with tempfile.TemporaryDirectory() as tmpd:
+            for i, p in enumerate(frame_paths):
+                dst = os.path.join(tmpd, f"{i:06d}.png")
+                shutil.copy2(p, dst)
+            cmd = [
+                "ffmpeg", "-y", "-framerate", f"{fps:.6f}",
+                "-i", os.path.join(tmpd, "%06d.png"),
+                "-c:v", "libx264", "-preset", "slow", "-crf", "0",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                out_path
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return
+
+    # Fallback (non strict lossless)
+    first = cv2.imread(frame_paths[0], cv2.IMREAD_GRAYSCALE)
+    h, w = first.shape[:2]
+    writer = _try_open_video_writer(out_path, fps, (w, h))
+    try:
+        for p in frame_paths:
+            img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+            depth3 = cv2.merge([img, img, img])
+            writer.write(depth3)
+    finally:
+        writer.release()
+
+def _git_available() -> bool:
+    return shutil.which("git") is not None
+
+def _download_zip_and_extract(url: str, dst_dir: str):
+    os.makedirs(os.path.dirname(dst_dir), exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmpd:
+        zip_path = os.path.join(tmpd, "repo.zip")
+        urllib.request.urlretrieve(url, zip_path)
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(tmpd)
+        # Le dossier extrait ressemble à Video-Depth-Anything-main/
+        cand = [p for p in glob.glob(os.path.join(tmpd, "*")) if os.path.isdir(p) and os.path.basename(p).startswith("Video-Depth-Anything")]
+        if not cand:
+            raise RuntimeError("Failed to extract Video-Depth-Anything zip.")
+        shutil.move(cand[0], dst_dir)
+
+def _ensure_timm():
+    try:
+        import timm  # noqa
+        return
+    except Exception:
+        pass
+    # Install timm silently
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "timm"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[VDA] Warning: failed to auto-install timm: {e}")
+
+_VDA_PREPARED = False
+
+def ensure_vda_ready(encoder: str):
+    """
+    Prépare automatiquement le repo VDA et les poids requis.
+    - Clone GitHub si VDA_DIR absent
+    - Télécharge le .pth approprié depuis Hugging Face vers VDA_DIR/checkpoints/
+    """
+    global _VDA_PREPARED, VDA_DIR
+    if _VDA_PREPARED:
+        return
+    repo_needed = not (os.path.isdir(VDA_DIR) and os.path.isfile(os.path.join(VDA_DIR, "run.py")))
+    if repo_needed:
+        print(f"[VDA] Preparing repo at {VDA_DIR}...")
+        try:
+            os.makedirs(os.path.dirname(VDA_DIR), exist_ok=True)
+            if _git_available():
+                subprocess.run(["git", "clone", "--depth", "1", "https://github.com/DepthAnything/Video-Depth-Anything", VDA_DIR], check=True)
+            else:
+                # fallback: zip download
+                _download_zip_and_extract("https://github.com/DepthAnything/Video-Depth-Anything/archive/refs/heads/main.zip", VDA_DIR)
+        except Exception as e:
+            raise RuntimeError(f"Cannot prepare Video-Depth-Anything repo: {e}")
+
+    # timm requis dans la plupart des implémentations
+    _ensure_timm()
+
+    # Télécharge le checkpoint HF
+    ckpt_map = {
+        "vits": ("depth-anything/Video-Depth-Anything-Small", "video_depth_anything_vits.pth"),
+        "vitb": ("depth-anything/Video-Depth-Anything-Base",  "video_depth_anything_vitb.pth"),
+        "vitl": ("depth-anything/Video-Depth-Anything-Large", "video_depth_anything_vitl.pth"),
+    }
+    enc = encoder.lower()
+    if enc not in ckpt_map:
+        enc = "vits"
+    repo_id, fname = ckpt_map[enc]
+    ckpt_dir = os.path.join(VDA_DIR, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, fname)
+    if not os.path.isfile(ckpt_path):
+        print(f"[VDA] Downloading weights {repo_id}/{fname} ...")
+        try:
+            downloaded = hf_hub_download(repo_id=repo_id, filename=fname, token=HF_TOKEN or None, local_dir=ckpt_dir, local_dir_use_symlinks=False)
+            if os.path.abspath(downloaded) != os.path.abspath(ckpt_path):
+                shutil.copy2(downloaded, ckpt_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to download VDA weights: {e}")
+    else:
+        print(f"[VDA] Weights already present: {ckpt_path}")
+
+    # run.py présent ?
+    run_py = os.path.join(VDA_DIR, "run.py")
+    if not os.path.isfile(run_py):
+        raise RuntimeError("VDA run.py not found after preparation.")
+
+    _VDA_PREPARED = True
+
+def process_video_to_depth_vda(color_path: str, out_depth_path: str):
+    """
+    Lance Video-Depth-Anything (Small/Base/Large – par défaut Small) en sous-process.
+    Sortie: depth.mp4 en niveaux de gris. Si PNGs, on ré-encode en CRF 0.
+    """
+    ensure_vda_ready(VDA_ENCODER)
+
+    run_py = os.path.join(VDA_DIR, "run.py")
+
+    # Répertoire de sortie temporaire
+    tmp_out = os.path.join(PRODUCTIONS_DIR, f"vda_{uuid.uuid4().hex}")
+    os.makedirs(tmp_out, exist_ok=True)
+
+    # Arguments
+    cmd = [
+        sys.executable, run_py,
+        "--input_video", color_path,
+        "--output_dir", tmp_out,
+        "--encoder", VDA_ENCODER,
+        "--input_size", str(VDA_INPUT_SIZE),
+        "--max_res", str(VDA_MAX_RES),
+        "--grayscale"
+    ]
+    if VDA_MAX_LEN is not None and VDA_MAX_LEN >= 0:
+        cmd += ["--max_len", str(VDA_MAX_LEN)]
+    if VDA_TARGET_FPS is not None and VDA_TARGET_FPS >= 0:
+        cmd += ["--target_fps", str(VDA_TARGET_FPS)]
+    if VDA_FP32:
+        cmd += ["--fp32"]
+
+    # Exécute VDA
+    try:
+        subprocess.run(cmd, cwd=VDA_DIR, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Video-Depth-Anything failed: {e}")
+
+    # Cherche un mp4 directement
+    depth_mp4_src = _find_latest_file(tmp_out, "*.mp4")
+    if depth_mp4_src:
+        try:
+            if ffmpeg_available():
+                cmd2 = ["ffmpeg", "-y", "-i", depth_mp4_src, "-c", "copy", "-movflags", "+faststart", out_depth_path]
+                subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            else:
+                shutil.copy2(depth_mp4_src, out_depth_path)
+        finally:
+            shutil.rmtree(tmp_out, ignore_errors=True)
+        return
+
+    # Sinon, prend les PNGs et encode CRF 0
+    frames = sorted(glob.glob(os.path.join(tmp_out, "**", "*.png"), recursive=True))
+    if not frames:
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        raise RuntimeError("Video-Depth-Anything produced no mp4 or png frames.")
+
+    _, _, fps = _probe_video_info(color_path)
+    _encode_pngs_to_mp4(frames, out_depth_path, fps)
+    shutil.rmtree(tmp_out, ignore_errors=True)
+
+# =========================
+# HTML — Drag & drop (images + videos + .x25d)
 # =========================
 DRAGDROP_HTML = """
 <!doctype html>
@@ -662,13 +1160,13 @@ DRAGDROP_HTML = """
   <div class="wrap">
     <div class="panel">
       <h1>Real 3D effect (displacement mesh)</h1>
-      <p>Drop an image (JPG/PNG/WEBP) or a video (MP4/AVI/WEBM). Depth is computed offline. Video audio is preserved.</p>
+      <p>Drop an image (JPG/PNG/WEBP), a video (MP4/AVI/WEBM), or a portable .x25d package.</p>
       <div id="dz" class="dz">
         <div class="row">
           <button id="pick" class="btn">Choose file</button>
-          <input id="file" type="file" accept="image/jpeg,image/jpg,image/webp,image/png,video/mp4,video/webm,video/x-msvideo" hidden />
+          <input id="file" type="file" accept="image/jpeg,image/jpg,image/webp,image/png,video/mp4,video/webm,video/x-msvideo,.x25d,application/octet-stream" hidden />
         </div>
-        <div class="hint">Images: .jpg .jpeg .webp .png • Videos: .mp4 .avi .webm</div>
+        <div class="hint">Images: .jpg .jpeg .webp .png • Videos: .mp4 .avi .webm • Packages: .x25d</div>
         <div id="err" class="err"></div>
       </div>
     </div>
@@ -689,24 +1187,39 @@ DRAGDROP_HTML = """
     function showErr(msg){ err.textContent = msg; err.style.display = msg ? 'block' : 'none'; }
     function isVideo(f){ return f && f.type && f.type.startsWith('video'); }
     function isImage(f){ return f && f.type && f.type.startsWith('image'); }
+    function isPack(f){ return !!f && ((f.name||"").toLowerCase().endsWith(".x25d") || (!f.type && (f.name||"").toLowerCase().endsWith(".x25d")) || f.type === "application/octet-stream"); }
 
     async function upload(f){
-      if(!isImage(f) && !isVideo(f)){
-        showErr("Unsupported format. Use JPG/JPEG/WEBP/PNG or MP4/AVI/WEBM."); return;
+      const pack = isPack(f), vid = isVideo(f), img = isImage(f);
+      if(!pack && !img && !vid){
+        showErr("Unsupported format. Use JPG/JPEG/WEBP/PNG, MP4/AVI/WEBM, or .x25d."); return;
       }
       showErr("");
-      const isVid = isVideo(f);
-      showOverlay(true, isVid ? "Processing video (offline)… This may take a while." : "Estimating depth…");
+      showOverlay(true, pack ? "Importing package…" : (vid ? "Processing video (offline)… This may take a while." : "Estimating depth…"));
       try {
         const fd = new FormData();
-        fd.append(isVid ? 'video' : 'image', f, f.name || (isVid ? 'upload.mp4' : 'upload.jpg'));
-        const endpoint = isVid ? '/upload-video' : '/upload';
+        let endpoint = '';
+        if (pack){ fd.append('x25d', f, f.name || 'package.x25d'); endpoint = '/upload-x25d'; }
+        else if (vid){ fd.append('video', f, f.name || 'upload.mp4'); endpoint = '/upload-video'; }
+        else { fd.append('image', f, f.name || 'upload.jpg'); }
+
         const res = await fetch(endpoint, { method:'POST', body: fd });
         const j = await res.json();
         if(!res.ok){ throw new Error(j?.detail || j?.error || res.statusText); }
-        const url = isVid
-          ? '/view-video?vid=' + encodeURIComponent(j.color) + '&d=' + encodeURIComponent(j.depth)
-          : '/view?img=' + encodeURIComponent(j.img) + '&d=' + encodeURIComponent(j.depth) + '&n=' + encodeURIComponent(j.normal);
+
+        let url = '';
+        if (pack){
+          if (j.type === 'image'){
+            const packed = j.packed ? '1' : '0';
+            url = '/view?img=' + encodeURIComponent(j.img) + '&d=' + encodeURIComponent(j.depth) + '&n=' + encodeURIComponent(j.normal) + '&packed=' + packed;
+          } else {
+            url = '/view-video?vid=' + encodeURIComponent(j.color) + '&d=' + encodeURIComponent(j.depth);
+          }
+        } else if (vid){
+          url = '/view-video?vid=' + encodeURIComponent(j.color) + '&d=' + encodeURIComponent(j.depth);
+        } else {
+          url = '/view?img=' + encodeURIComponent(j.img) + '&d=' + encodeURIComponent(j.depth) + '&n=' + encodeURIComponent(j.normal);
+        }
         window.location.href = url;
       } catch(e){
         showOverlay(false);
@@ -743,7 +1256,8 @@ def viewer_html(img_url: str, depth_url: str, normal_url: str, depth_packed: boo
     html, body { width:100%; height:100%; overflow:hidden; background:#000; color:#fff; font: 13px/1.4 -apple-system, system-ui, sans-serif; }
     #c { width:100vw; height:100vh; display:block; }
     /* Auto-hide cursor when idle */
-    body.hide-cursor, body.hide-cursor * { cursor: none !important; }
+    /* Cursor always hidden on /view */
+    body, body * { cursor: none !important; }
   </style>
 </head>
 <body>
@@ -1123,8 +1637,8 @@ def viewer_html(img_url: str, depth_url: str, normal_url: str, depth_packed: boo
 
       // Motion-driven DOF
       dofPass.uniforms.maxBlur.value = (DOF_BASE_BLUR_PX + DOF_GAIN_BLUR_PX * m) * dpr;
-      dofPass.uniforms.nearStr.value = DOF_NEAR_BASE + DOF_NEAR_GAIN * m; // foreground: small increase
-      dofPass.uniforms.farStr.value  = DOF_FAR_BASE  + DOF_FAR_GAIN  * m; // background: more increase
+      dofPass.uniforms.nearStr.value = DOF_NEAR_BASE + DOF_NEAR_GAIN * m; // foreground
+      dofPass.uniforms.farStr.value  = DOF_FAR_BASE  + DOF_FAR_GAIN  * m; // background
 
       composer.render();
     }
@@ -1154,7 +1668,8 @@ def viewer_video_html(color_url: str, depth_url: str):
     #mutehint { position:fixed; top:14px; left:50%; transform:translateX(-50%); background:rgba(0,0,0,.5); padding:6px 10px; border-radius:12px; font-size:12px; opacity:0; transition:opacity .3s ease; pointer-events:none; }
     #mutehint.show { opacity: .9; }
     /* Auto-hide cursor in preview */
-    body.hide-cursor, body.hide-cursor * { cursor: none !important; }
+    /* Cursor always hidden on /view */
+    body, body * { cursor: none !important; }
   </style>
 </head>
 <body>
@@ -1490,7 +2005,7 @@ def viewer_video_html(color_url: str, depth_url: str):
 
     function updateUpscaleSoft(){
       const upscale=Math.max(window.innerWidth/vidW, window.innerHeight/vidH);
-      const k=THREE.MathUtils.clamp((upscale-1.0)/(UPSCALE_SOFT_END-1.0),0.0,1.0);
+      const k=THREE.MathUtils.clamp((upscale-1.0)/(2.4-1.0),0.0,1.0);
       material.uniforms.softK.value=k;
     }
     function onResize(){
@@ -1576,8 +2091,9 @@ async def view(request: Request):
     n   = request.query_params.get("n")
     if not img or not d or not n:
         raise HTTPException(status_code=400, detail="Missing parameters (img, d, n).")
-    # depth_packed suit la config serveur SAVE_DEPTH_RG16
-    return HTMLResponse(viewer_html(img, d, n, depth_packed=SAVE_DEPTH_RG16))
+    packed_q = _parse_bool(request.query_params.get("packed"), default=None)
+    depth_packed = SAVE_DEPTH_RG16 if packed_q is None else bool(packed_q)
+    return HTMLResponse(viewer_html(img, d, n, depth_packed=depth_packed))
 
 @app.get("/view-video", response_class=HTMLResponse)
 async def view_video(request: Request):
@@ -1610,10 +2126,20 @@ async def upload_image(image: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DAV2 error: {e}")
 
+    # Pack .x25d en productions/ (portable)
+    try:
+        model_id = _DAV2L_ID or ""
+    except Exception:
+        model_id = ""
+    pack = pack_x25d_image(img_id, img_path, depth_path, normal_path, packed_rg16=SAVE_DEPTH_RG16, model_id=model_id)
+
     img_url    = f"/uploads/{os.path.basename(img_path)}"
     depth_url  = f"/depths/{os.path.basename(depth_path)}"
     normal_url = f"/normals/{os.path.basename(normal_path)}"
-    return JSONResponse({"img": img_url, "depth": depth_url, "normal": normal_url})
+    return JSONResponse({
+        "img": img_url, "depth": depth_url, "normal": normal_url,
+        "x25d": pack["x25d_url"]
+    })
 
 @app.post("/upload-video")
 async def upload_video(video: UploadFile = File(...)):
@@ -1633,16 +2159,169 @@ async def upload_video(video: UploadFile = File(...)):
 
     color_mp4 = os.path.join(VIDEO_DIR, f"color_{vid_id}.mp4")
     try:
-        transcode_to_mp4_hd_hq(raw_path, color_mp4, lossless_env=False)
+        # Préserve la qualité: stream-copy si possible, sinon HQ/lossless
+        transcode_to_mp4_hd_hq(raw_path, color_mp4, lossless_env=VDA_STRICT_LOSSLESS)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"ffmpeg transcode failed: {e}")
 
     depth_mp4 = os.path.join(DEPTH_VIDEO_DIR, f"depth_{vid_id}.mp4")
+    used_vda = False
     try:
-        process_video_to_depth(color_mp4, depth_mp4, ema_alpha=0.85)
+        if VIDEO_BACKEND == "vda":
+            try:
+                process_video_to_depth_vda(color_mp4, depth_mp4)
+                used_vda = True
+            except Exception as e_vda:
+                print(f"[Video] VDA backend failed ({e_vda}); falling back to DAV2 Small.")
+                process_video_to_depth(color_mp4, depth_mp4, ema_alpha=0.85)
+        else:
+            process_video_to_depth(color_mp4, depth_mp4, ema_alpha=0.85)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Depth processing failed: {e}")
 
+    # Pack .x25d en productions/ (portable)
+    try:
+        if used_vda:
+            enc = VDA_ENCODER.lower()
+            human = "Small" if enc == "vits" else ("Base" if enc == "vitb" else ("Large" if enc == "vitl" else enc))
+            model_id = f"Video-Depth-Anything-{human}"
+        else:
+            model_id = _DAV2S_ID or ""
+    except Exception:
+        model_id = ""
+    packv = pack_x25d_video(vid_id, color_mp4, depth_mp4, model_id=model_id)
+
     color_url = f"/videos/{os.path.basename(color_mp4)}"
     depth_url = f"/depth_videos/{os.path.basename(depth_mp4)}"
-    return JSONResponse({"color": color_url, "depth": depth_url})
+    return JSONResponse({
+        "color": color_url, "depth": depth_url,
+        "x25d": packv["x25d_url"]
+    })
+
+@app.post("/upload-x25d")
+async def upload_x25d(x25d: UploadFile = File(...)):
+    name = (x25d.filename or "").lower()
+    if not name.endswith(".x25d"):
+        raise HTTPException(status_code=400, detail="Upload a .x25d package.")
+    pkg_id = uuid.uuid4().hex
+    pkg_path = os.path.join(PRODUCTIONS_DIR, f"import_{pkg_id}.x25d")
+    async with aiofiles.open(pkg_path, "wb") as out:
+        while True:
+            chunk = await x25d.read(1024 * 1024)
+            if not chunk: break
+            await out.write(chunk)
+    try:
+        info = import_x25d_package(pkg_path)
+        if info["type"] == "image":
+            return JSONResponse({
+                "type": "image",
+                "img": info["img_url"],
+                "depth": info["depth_url"],
+                "normal": info["normal_url"],
+                "packed": bool(info.get("packed", False)),
+            })
+        else:
+            return JSONResponse({
+                "type": "video",
+                "color": info["color_url"],
+                "depth": info["depth_url"],
+            })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"x25d import failed: {e}")
+
+# =========================
+# CLI support
+# =========================
+def _cli_process_path(p: str):
+    p = os.path.abspath(p)
+    if not os.path.exists(p):
+        print(f"[CLI] Not found: {p}")
+        return 1
+
+    ext = os.path.splitext(p)[1].lower()
+    if ext == ".x25d":
+        # Importer tel quel
+        dst = os.path.join(PRODUCTIONS_DIR, os.path.basename(p))
+        if dst != p:
+            shutil.copy2(p, dst)
+        info = import_x25d_package(dst)
+        if info["type"] == "image":
+            print(f"[CLI] Imported image package -> {dst}")
+            print(f"      View: /view?img={info['img_url']}&d={info['depth_url']}&n={info['normal_url']}&packed=1")
+        else:
+            print(f"[CLI] Imported video package -> {dst}")
+            print(f"      View: /view-video?vid={info['color_url']}&d={info['depth_url']}")
+        return 0
+
+    # Deviner image/vidéo
+    is_img = ext in (".jpg", ".jpeg", ".png", ".webp")
+    is_vid = ext in (".mp4", ".avi", ".webm", ".mov", ".mkv")
+    if not is_img and not is_vid:
+        print(f"[CLI] Unsupported: {ext}")
+        return 2
+
+    prod_id = uuid.uuid4().hex
+    if is_img:
+        # Sorties dans productions/<prod_id>/
+        work_dir = os.path.join(PRODUCTIONS_DIR, prod_id)
+        os.makedirs(work_dir, exist_ok=True)
+        color_dst = _copy_to_dir(work_dir, p, f"color{ext}")
+        depth_dst = os.path.join(work_dir, "depth.png")
+        normal_dst= os.path.join(work_dir, "normal.png")
+        # Inference
+        try:
+            predict_depth_dav2(color_dst, depth_dst, normal_dst)
+        except Exception as e:
+            print(f"[CLI] Depth error: {e}")
+            return 3
+        model_id = _DAV2L_ID or ""
+        pack = pack_x25d_image(prod_id, color_dst, depth_dst, normal_dst, packed_rg16=SAVE_DEPTH_RG16, model_id=model_id)
+        print(f"[CLI] Image packaged -> {pack['x25d_path']}")
+        print(f"      View: /view?img={pack['color_url']}&d={pack['depth_url']}&n={pack['normal_url']}&packed={'1' if pack['packed'] else '0'}")
+        return 0
+    else:
+        # Vidéo: transcode + depth + pack
+        work_dir = os.path.join(PRODUCTIONS_DIR, prod_id)
+        os.makedirs(work_dir, exist_ok=True)
+        color_mp4 = os.path.join(work_dir, "color.mp4")
+        try:
+            transcode_to_mp4_hd_hq(p, color_mp4, lossless_env=VDA_STRICT_LOSSLESS)
+        except Exception as e:
+            print(f"[CLI] ffmpeg transcode failed: {e}")
+            return 4
+        depth_mp4 = os.path.join(work_dir, "depth.mp4")
+        used_vda = False
+        try:
+            if VIDEO_BACKEND == "vda":
+                try:
+                    process_video_to_depth_vda(color_mp4, depth_mp4)
+                    used_vda = True
+                except Exception as e_vda:
+                    print(f"[CLI] VDA backend failed; fallback to DAV2 Small: {e_vda}")
+                    process_video_to_depth(color_mp4, depth_mp4, ema_alpha=0.85)
+            else:
+                process_video_to_depth(color_mp4, depth_mp4, ema_alpha=0.85)
+        except Exception as e:
+            print(f"[CLI] Depth processing failed: {e}")
+            return 5
+        if used_vda:
+            enc = VDA_ENCODER.lower()
+            human = "Small" if enc == "vits" else ("Base" if enc == "vitb" else ("Large" if enc == "vitl" else enc))
+            model_id = f"Video-Depth-Anything-{human}"
+        else:
+            model_id = _DAV2S_ID or ""
+        packv = pack_x25d_video(prod_id, color_mp4, depth_mp4, model_id=model_id)
+        print(f"[CLI] Video packaged -> {packv['x25d_path']}")
+        print(f"      View: /view-video?vid={packv['color_url']}&d={packv['depth_url']}")
+        return 0
+
+if __name__ == "__main__":
+    # Si on passe des fichiers en arguments => mode CLI. Sinon on lance l'API.
+    if len(sys.argv) > 1:
+        rc = 0
+        for arg in sys.argv[1:]:
+            rc |= _cli_process_path(arg)
+        sys.exit(rc)
+    else:
+        import uvicorn
+        uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT","7860")), reload=False)
