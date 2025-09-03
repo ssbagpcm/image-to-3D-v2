@@ -1160,13 +1160,13 @@ DRAGDROP_HTML = """
   <div class="wrap">
     <div class="panel">
       <h1>Real 3D effect (displacement mesh)</h1>
-      <p>Drop an image (JPG/PNG/WEBP), a video (MP4/AVI/WEBM), or a portable .x25d package.</p>
+      <p>Drop a portable .x25d package here.</p>
       <div id="dz" class="dz">
         <div class="row">
           <button id="pick" class="btn">Choose file</button>
           <input id="file" type="file" accept="image/jpeg,image/jpg,image/webp,image/png,video/mp4,video/webm,video/x-msvideo,.x25d,application/octet-stream" hidden />
         </div>
-        <div class="hint">Images: .jpg .jpeg .webp .png • Videos: .mp4 .avi .webm • Packages: .x25d</div>
+        <div class="hint">Packages: .x25d</div>
         <div id="err" class="err"></div>
       </div>
     </div>
